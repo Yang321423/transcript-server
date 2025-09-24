@@ -8,12 +8,11 @@ from youtube_transcript_api import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
-    TooManyRequests,
 )
 
 app = FastAPI(title="YouTube Captions Proxy")
 
-# Allow all origins (for development). Restrict in production.
+# CORS: allow all during development; restrict to specific origins in production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,7 +29,7 @@ def _format_ts(sec: float) -> str:
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = int(sec % 60)
-    ms = int(round((sec - math.floor(sec)) * 1000))
+    ms = int(round((sec - int(sec)) * 1000))
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 def to_srt(items: List[dict]) -> str:
@@ -58,6 +57,7 @@ def get_transcript(
     langs = [x.strip() for x in lang.split(",") if x.strip()]
 
     try:
+        # 1) Try to get transcript directly in requested languages
         items = YouTubeTranscriptApi.get_transcript(videoId, languages=langs)
         if format == "json":
             return {"videoId": videoId, "lang": langs[0], "items": items}
@@ -65,14 +65,18 @@ def get_transcript(
             return Response(content=to_srt(items), media_type="text/plain; charset=utf-8")
 
     except NoTranscriptFound:
+        # 2) Fallback: inspect transcript list and honor preference
         try:
             tl = YouTubeTranscriptApi.list_transcripts(videoId)
         except TranscriptsDisabled:
             raise HTTPException(status_code=404, detail="Transcripts disabled for this video.")
         except VideoUnavailable:
             raise HTTPException(status_code=404, detail="Video unavailable.")
-        except TooManyRequests:
-            raise HTTPException(status_code=429, detail="Rate limited by YouTube. Try again later.")
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "TooManyRequests" in msg:
+                raise HTTPException(status_code=429, detail="Rate limited by YouTube. Try again later.")
+            raise HTTPException(status_code=500, detail=msg)
 
         transcript = None
 
@@ -91,6 +95,7 @@ def get_transcript(
 
         transcript = pick_transcript()
 
+        # 3) Translate fallback
         if not transcript and allowTranslate:
             try:
                 manual = [t for t in tl if not t.is_generated]
@@ -114,11 +119,13 @@ def get_transcript(
         else:
             return Response(content=to_srt(items), media_type="text/plain; charset=utf-8")
 
-    except TooManyRequests:
-        raise HTTPException(status_code=429, detail="Rate limited by YouTube. Try again later.")
-    except VideoUnavailable:
-        raise HTTPException(status_code=404, detail="Video unavailable.")
     except TranscriptsDisabled:
         raise HTTPException(status_code=404, detail="Transcripts disabled for this video.")
+    except VideoUnavailable:
+        raise HTTPException(status_code=404, detail="Video unavailable.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Treat 429 or textual "TooManyRequests" as rate limit
+        msg = str(e)
+        if "429" in msg or "TooManyRequests" in msg:
+            raise HTTPException(status_code=429, detail="Rate limited by YouTube. Try again later.")
+        raise HTTPException(status_code=500, detail=msg)
