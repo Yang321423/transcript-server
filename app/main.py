@@ -10,8 +10,11 @@ from youtube_transcript_api import (
     VideoUnavailable,
 )
 
+import pkg_resources  # 라이브러리 버전 체크용
+
 app = FastAPI(title="YouTube Captions Proxy")
 
+# 개발 단계에서는 모든 origin 허용, 배포시 특정 도메인으로 제한 권장
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,10 +48,7 @@ def to_srt(items: List[dict]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 def check_scraping_block(exc: Exception) -> bool:
-    """
-    유튜브에서 스크래핑이 차단됐는지 간단 감지.
-    보통 429 Too Many Requests, 403 Forbidden 등이 해당.
-    """
+    """429 / 403 에러 메시지 기반으로 차단 여부 추정"""
     msg = str(exc).lower()
     if "429" in msg or "too many requests" in msg:
         return True
@@ -138,3 +138,19 @@ def _detail(user_msg: str, exc: Exception | None, debug: bool, scrapingBlocked: 
     if debug and exc is not None:
         base += f" | {type(exc).__name__}: {exc!s}"
     return base
+
+@app.get("/v1/diag")
+def diag():
+    """youtube-transcript-api 버전 및 샘플 호출 결과 확인"""
+    try:
+        ver = pkg_resources.get_distribution("youtube-transcript-api").version
+    except Exception:
+        ver = "UNKNOWN"
+
+    test_id = "5MgBikgcWnY"  # CrashCourse (자막 있음)
+    try:
+        items = YouTubeTranscriptApi.get_transcript(test_id, languages=["en"])
+        return {"ok": True, "yta_version": ver, "sample_items": len(items)}
+    except Exception as e:
+        blocked = check_scraping_block(e)
+        return {"ok": False, "yta_version": ver, "error": f"{type(e).__name__}: {e}", "scrapingBlocked": blocked}
