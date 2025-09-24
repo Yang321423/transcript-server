@@ -12,7 +12,6 @@ from youtube_transcript_api import (
 
 app = FastAPI(title="YouTube Captions Proxy")
 
-# CORS: allow all during development; restrict to specific origins in production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,41 +44,48 @@ def to_srt(items: List[dict]) -> str:
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 
+def check_scraping_block(exc: Exception) -> bool:
+    """
+    유튜브에서 스크래핑이 차단됐는지 간단 감지.
+    보통 429 Too Many Requests, 403 Forbidden 등이 해당.
+    """
+    msg = str(exc).lower()
+    if "429" in msg or "too many requests" in msg:
+        return True
+    if "forbidden" in msg or "403" in msg:
+        return True
+    return False
+
 @app.get("/v1/transcript")
 def get_transcript(
     videoId: str = Query(..., description="YouTube video id"),
     lang: str = Query("en", description="BCP-47 code (e.g., en, ko, ja). Multiple with comma"),
     format: str = Query("json", pattern="^(json|srt)$"),
-    prefer: str = Query("any", pattern="^(any|manual|generated)$",
-                        description="Priority: any | manual (uploader captions) | generated (auto)"),
+    prefer: str = Query("any", pattern="^(any|manual|generated)$"),
     allowTranslate: bool = Query(True, description="Translate if requested lang not found"),
+    debug: bool = Query(False, description="Return detailed error info if True"),
 ):
     langs = [x.strip() for x in lang.split(",") if x.strip()]
+    scrapingBlocked = False
 
     try:
-        # 1) Try to get transcript directly in requested languages
         items = YouTubeTranscriptApi.get_transcript(videoId, languages=langs)
         if format == "json":
-            return {"videoId": videoId, "lang": langs[0], "items": items}
+            return {"videoId": videoId, "lang": langs[0], "items": items, "scrapingBlocked": scrapingBlocked}
         else:
             return Response(content=to_srt(items), media_type="text/plain; charset=utf-8")
 
     except NoTranscriptFound:
-        # 2) Fallback: inspect transcript list and honor preference
         try:
             tl = YouTubeTranscriptApi.list_transcripts(videoId)
-        except TranscriptsDisabled:
-            raise HTTPException(status_code=404, detail="Transcripts disabled for this video.")
-        except VideoUnavailable:
-            raise HTTPException(status_code=404, detail="Video unavailable.")
+        except (TranscriptsDisabled, VideoUnavailable) as e:
+            scrapingBlocked = check_scraping_block(e)
+            raise HTTPException(status_code=404, detail=_detail("Transcript unavailable.", e, debug, scrapingBlocked))
         except Exception as e:
-            msg = str(e)
-            if "429" in msg or "TooManyRequests" in msg:
-                raise HTTPException(status_code=429, detail="Rate limited by YouTube. Try again later.")
-            raise HTTPException(status_code=500, detail=msg)
+            scrapingBlocked = check_scraping_block(e)
+            raise HTTPException(status_code=500, detail=_detail("Internal error while listing transcripts.", e, debug, scrapingBlocked))
 
         transcript = None
-
         def pick_transcript():
             if prefer in ("manual", "any"):
                 try:
@@ -95,7 +101,6 @@ def get_transcript(
 
         transcript = pick_transcript()
 
-        # 3) Translate fallback
         if not transcript and allowTranslate:
             try:
                 manual = [t for t in tl if not t.is_generated]
@@ -105,7 +110,7 @@ def get_transcript(
                 pass
 
         if not transcript:
-            raise HTTPException(status_code=404, detail="No transcript in requested languages.")
+            raise HTTPException(status_code=404, detail=_detail("No transcript in requested languages.", None, debug, scrapingBlocked))
 
         items = transcript.fetch()
         if format == "json":
@@ -115,17 +120,21 @@ def get_transcript(
                 "isTranslated": getattr(transcript, "language_code", "") != langs[0],
                 "isGenerated": getattr(transcript, "is_generated", False),
                 "items": items,
+                "scrapingBlocked": scrapingBlocked,
             }
         else:
             return Response(content=to_srt(items), media_type="text/plain; charset=utf-8")
 
-    except TranscriptsDisabled:
-        raise HTTPException(status_code=404, detail="Transcripts disabled for this video.")
-    except VideoUnavailable:
-        raise HTTPException(status_code=404, detail="Video unavailable.")
     except Exception as e:
-        # Treat 429 or textual "TooManyRequests" as rate limit
-        msg = str(e)
-        if "429" in msg or "TooManyRequests" in msg:
-            raise HTTPException(status_code=429, detail="Rate limited by YouTube. Try again later.")
-        raise HTTPException(status_code=500, detail=msg)
+        scrapingBlocked = check_scraping_block(e)
+        if scrapingBlocked:
+            raise HTTPException(status_code=429, detail=_detail("Rate limited or blocked by YouTube.", e, debug, scrapingBlocked))
+        raise HTTPException(status_code=500, detail=_detail("Internal server error.", e, debug, scrapingBlocked))
+
+def _detail(user_msg: str, exc: Exception | None, debug: bool, scrapingBlocked: bool) -> str:
+    base = user_msg
+    if scrapingBlocked:
+        base += " (scrapingBlocked=True)"
+    if debug and exc is not None:
+        base += f" | {type(exc).__name__}: {exc!s}"
+    return base
